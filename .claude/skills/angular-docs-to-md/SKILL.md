@@ -20,21 +20,35 @@ Examples:
 
 ## Steps
 
-### 1. Build the binary if needed
+### 1. Locate the binary
 
 ```bash
-ls /Users/kaspar/gh-2-md/target/release/angular-docs-to-md 2>/dev/null && echo "EXISTS" || echo "MISSING"
+which angular-docs-to-md 2>/dev/null && echo "IN_PATH" || echo "NOT_IN_PATH"
 ```
 
-If `MISSING`:
+If `IN_PATH`, skip to step 2.
+
+If `NOT_IN_PATH`, check for the repo via the env var `GH_2_MD_PATH`:
+
 ```bash
-cargo build --release --manifest-path /Users/kaspar/gh-2-md/Cargo.toml
+ls "${GH_2_MD_PATH}/target/release/angular-docs-to-md" 2>/dev/null && echo "EXISTS" || echo "MISSING"
 ```
+
+If `MISSING` (and `GH_2_MD_PATH` is set), build it:
+```bash
+cargo build --release --manifest-path "${GH_2_MD_PATH}/Cargo.toml"
+```
+
+If `GH_2_MD_PATH` is not set and the binary is not in PATH, tell the user to either:
+- Install the binary and add it to `PATH`, or
+- Set `GH_2_MD_PATH` to the root of the `gh-2-md` repo in their shell profile or `.claude/settings.json` env block.
 
 ### 2. Run the binary
 
 ```bash
-/Users/kaspar/gh-2-md/target/release/angular-docs-to-md <URL> [flags]
+# Uses PATH if available, otherwise falls back to the local build
+BINARY=$(which angular-docs-to-md 2>/dev/null || echo "${GH_2_MD_PATH}/target/release/angular-docs-to-md")
+"$BINARY" <URL> [flags]
 ```
 
 Flags:
