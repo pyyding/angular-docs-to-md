@@ -5,6 +5,7 @@ use axum::{
     routing::post,
     Router,
 };
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -135,11 +136,17 @@ fn build_markdown(link: &GithubLink, data: &Value, original_url: &str) -> String
                 .unwrap_or("");
             format!("[{owner}/{repo}@{short}: {msg}]({original_url})")
         }
-        GithubLink::Blob { owner, repo, branch, path } => {
-            let name = s("name");
-            let size = data["size"].as_u64().unwrap_or(0);
-            let _ = name;
-            format!("[{owner}/{repo}: {path}]({original_url}) `{branch}` {size}B")
+        GithubLink::Blob { path, .. } => {
+            let ext = path.rsplit('.').next().unwrap_or("");
+            let raw = data["content"].as_str().unwrap_or("");
+            // GitHub wraps base64 in newlines — strip them before decoding
+            let cleaned: String = raw.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+            let content = STANDARD
+                .decode(cleaned.as_bytes())
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or_default();
+            format!("```{ext}\n{content}```")
         }
         GithubLink::Release { owner, repo, tag } => {
             let name = s("name");
@@ -180,7 +187,6 @@ async fn convert(
 
     // Call GitHub API
     let api = api_url(&link);
-    println!("→ GitHub API: {api}");
 
     let mut req = Client::new()
         .get(&api)
@@ -199,10 +205,7 @@ async fn convert(
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, ResponseJson(ErrorResponse { error: e.to_string() })))?;
 
-    println!("  Response: {}", serde_json::to_string_pretty(&data).unwrap_or_default());
-
     let markdown = build_markdown(&link, &data, url);
-    println!("  Markdown: {markdown}");
 
     Ok(ResponseJson(ConvertResponse { markdown }))
 }
