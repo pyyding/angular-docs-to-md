@@ -5,7 +5,10 @@ use axum::{
     routing::post,
     Router,
 };
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::env;
 
 #[derive(Deserialize)]
 struct ConvertRequest {
@@ -22,95 +25,186 @@ struct ErrorResponse {
     error: String,
 }
 
-fn github_url_to_markdown(url: &str) -> Result<String, String> {
-    let url = url.trim();
+/// Parsed representation of a GitHub URL.
+enum GithubLink<'a> {
+    Repo { owner: &'a str, repo: &'a str },
+    Issue { owner: &'a str, repo: &'a str, number: &'a str },
+    Pull { owner: &'a str, repo: &'a str, number: &'a str },
+    Commit { owner: &'a str, repo: &'a str, sha: &'a str },
+    Blob { owner: &'a str, repo: &'a str, branch: &'a str, path: String },
+    Tree { owner: &'a str, repo: &'a str, branch: &'a str, sub: String },
+    Release { owner: &'a str, repo: &'a str, tag: &'a str },
+    Other { owner: &'a str, repo: &'a str },
+}
 
-    // Basic GitHub URL patterns:
-    // https://github.com/{owner}/{repo}
-    // https://github.com/{owner}/{repo}/blob/{branch}/{path}
-    // https://github.com/{owner}/{repo}/tree/{branch}/{path}
-    // https://github.com/{owner}/{repo}/issues/{number}
-    // https://github.com/{owner}/{repo}/pull/{number}
-    // https://github.com/{owner}/{repo}/commit/{sha}
-
-    if !url.contains("github.com") {
-        return Err("Not a GitHub URL".to_string());
-    }
-
-    // Strip trailing slashes
-    let url = url.trim_end_matches('/');
-
-    // Parse path segments after github.com
-    let path = url
-        .split("github.com/")
-        .nth(1)
-        .ok_or("Invalid GitHub URL")?;
-
-    let parts: Vec<&str> = path.split('/').collect();
-
+fn parse_github_url<'a>(parts: &'a [&'a str]) -> Result<GithubLink<'a>, String> {
     if parts.len() < 2 {
         return Err("Could not parse owner/repo from URL".to_string());
     }
-
     let owner = parts[0];
     let repo = parts[1];
 
-    let md = match parts.get(2) {
-        None => {
-            // Just a repo link
-            format!("[{owner}/{repo}]({url})")
+    let link = match parts.get(2) {
+        None => GithubLink::Repo { owner, repo },
+        Some(&"issues") if parts.len() >= 4 => GithubLink::Issue { owner, repo, number: parts[3] },
+        Some(&"pull") if parts.len() >= 4 => GithubLink::Pull { owner, repo, number: parts[3] },
+        Some(&"commit") if parts.len() >= 4 => GithubLink::Commit { owner, repo, sha: parts[3] },
+        Some(&"blob") if parts.len() >= 5 => GithubLink::Blob {
+            owner,
+            repo,
+            branch: parts[3],
+            path: parts[4..].join("/"),
+        },
+        Some(&"tree") if parts.len() >= 4 => GithubLink::Tree {
+            owner,
+            repo,
+            branch: parts[3],
+            sub: if parts.len() > 4 { format!("/{}", parts[4..].join("/")) } else { String::new() },
+        },
+        Some(&"releases") if parts.get(3) == Some(&"tag") && parts.len() >= 5 => {
+            GithubLink::Release { owner, repo, tag: parts[4] }
         }
-        Some(&"blob") if parts.len() >= 5 => {
-            // File link: /blob/{branch}/{path...}
-            let file_path = parts[4..].join("/");
-            let branch = parts[3];
-            format!("[{owner}/{repo}: {file_path} ({branch})]({url})")
-        }
-        Some(&"tree") if parts.len() >= 4 => {
-            // Directory/branch link
-            let branch = parts[3];
-            let sub = if parts.len() > 4 {
-                format!("/{}", parts[4..].join("/"))
-            } else {
-                String::new()
-            };
-            format!("[{owner}/{repo}{sub} ({branch})]({url})")
-        }
-        Some(&"issues") if parts.len() >= 4 => {
-            let number = parts[3];
-            format!("[{owner}/{repo}#{number}]({url})")
-        }
-        Some(&"pull") if parts.len() >= 4 => {
-            let number = parts[3];
-            format!("[{owner}/{repo} PR#{number}]({url})")
-        }
-        Some(&"commit") if parts.len() >= 4 => {
-            let sha = &parts[3][..7.min(parts[3].len())];
-            format!("[{owner}/{repo}@{sha}]({url})")
-        }
-        Some(&"releases") if parts.get(4) == Some(&"tag") && parts.len() >= 6 => {
-            let tag = parts[5];
-            format!("[{owner}/{repo} {tag}]({url})")
-        }
-        _ => {
-            // Fallback: just wrap it
-            format!("[{owner}/{repo}]({url})")
-        }
+        _ => GithubLink::Other { owner, repo },
     };
+    Ok(link)
+}
 
-    Ok(md)
+fn api_url(link: &GithubLink) -> String {
+    match link {
+        GithubLink::Repo { owner, repo } => {
+            format!("https://api.github.com/repos/{owner}/{repo}")
+        }
+        GithubLink::Issue { owner, repo, number } => {
+            format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}")
+        }
+        GithubLink::Pull { owner, repo, number } => {
+            format!("https://api.github.com/repos/{owner}/{repo}/pulls/{number}")
+        }
+        GithubLink::Commit { owner, repo, sha } => {
+            format!("https://api.github.com/repos/{owner}/{repo}/commits/{sha}")
+        }
+        GithubLink::Blob { owner, repo, branch, path } => {
+            format!("https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}")
+        }
+        GithubLink::Release { owner, repo, tag } => {
+            format!("https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}")
+        }
+        // Tree and Other don't have a clean single API endpoint — fall back to repo
+        GithubLink::Tree { owner, repo, .. } | GithubLink::Other { owner, repo } => {
+            format!("https://api.github.com/repos/{owner}/{repo}")
+        }
+    }
+}
+
+fn build_markdown(link: &GithubLink, data: &Value, original_url: &str) -> String {
+    let s = |key: &str| data[key].as_str().unwrap_or("").to_string();
+
+    match link {
+        GithubLink::Repo { owner, repo } => {
+            let desc = s("description");
+            let stars = data["stargazers_count"].as_u64().unwrap_or(0);
+            let lang = s("language");
+            let label = if desc.is_empty() {
+                format!("{owner}/{repo}")
+            } else {
+                format!("{owner}/{repo} — {desc}")
+            };
+            let mut md = format!("[{label}]({original_url})");
+            if !lang.is_empty() || stars > 0 {
+                md.push_str(&format!(" `{lang}` ⭐{stars}"));
+            }
+            md
+        }
+        GithubLink::Issue { owner, repo, number } => {
+            let title = s("title");
+            let state = s("state");
+            format!("[{owner}/{repo}#{number}: {title}]({original_url}) `{state}`")
+        }
+        GithubLink::Pull { owner, repo, number } => {
+            let title = s("title");
+            let state = s("state");
+            format!("[{owner}/{repo} PR#{number}: {title}]({original_url}) `{state}`")
+        }
+        GithubLink::Commit { owner, repo, sha } => {
+            let short = &sha[..7.min(sha.len())];
+            let msg = data["commit"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or("");
+            format!("[{owner}/{repo}@{short}: {msg}]({original_url})")
+        }
+        GithubLink::Blob { owner, repo, branch, path } => {
+            let name = s("name");
+            let size = data["size"].as_u64().unwrap_or(0);
+            let _ = name;
+            format!("[{owner}/{repo}: {path}]({original_url}) `{branch}` {size}B")
+        }
+        GithubLink::Release { owner, repo, tag } => {
+            let name = s("name");
+            let label = if name.is_empty() { tag.to_string() } else { name };
+            format!("[{owner}/{repo} {label}]({original_url})")
+        }
+        GithubLink::Tree { owner, repo, branch, sub } => {
+            format!("[{owner}/{repo}{sub}]({original_url}) `{branch}`")
+        }
+        GithubLink::Other { owner, repo } => {
+            format!("[{owner}/{repo}]({original_url})")
+        }
+    }
 }
 
 async fn convert(
     Json(payload): Json<ConvertRequest>,
 ) -> Result<ResponseJson<ConvertResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    match github_url_to_markdown(&payload.url) {
-        Ok(markdown) => Ok(ResponseJson(ConvertResponse { markdown })),
-        Err(e) => Err((
+    let url = payload.url.trim().trim_end_matches('/');
+
+    if !url.contains("github.com") {
+        return Err((
             StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse { error: e }),
-        )),
+            ResponseJson(ErrorResponse { error: "Not a GitHub URL".into() }),
+        ));
     }
+
+    let path = url
+        .split("github.com/")
+        .nth(1)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, ResponseJson(ErrorResponse { error: "Invalid GitHub URL".into() })))?;
+
+    let parts: Vec<&str> = path.split('/').collect();
+
+    let link = parse_github_url(&parts).map_err(|e| {
+        (StatusCode::BAD_REQUEST, ResponseJson(ErrorResponse { error: e }))
+    })?;
+
+    // Call GitHub API
+    let api = api_url(&link);
+    println!("→ GitHub API: {api}");
+
+    let mut req = Client::new()
+        .get(&api)
+        .header("User-Agent", "gh2md/0.1")
+        .header("Accept", "application/vnd.github+json");
+
+    if let Ok(token) = env::var("GITHUB_TOKEN") {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+
+    let data: Value = req
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, ResponseJson(ErrorResponse { error: e.to_string() })))?
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, ResponseJson(ErrorResponse { error: e.to_string() })))?;
+
+    println!("  Response: {}", serde_json::to_string_pretty(&data).unwrap_or_default());
+
+    let markdown = build_markdown(&link, &data, url);
+    println!("  Markdown: {markdown}");
+
+    Ok(ResponseJson(ConvertResponse { markdown }))
 }
 
 #[tokio::main]
@@ -119,11 +213,13 @@ async fn main() {
 
     let addr = "0.0.0.0:3000";
     println!("gh2md API listening on http://{addr}");
+    if env::var("GITHUB_TOKEN").is_ok() {
+        println!("  GitHub token: ✓ (5000 req/hour)");
+    } else {
+        println!("  GitHub token: ✗ (60 req/hour — set GITHUB_TOKEN to increase)");
+    }
     println!();
-    println!("Usage:");
-    println!("  curl -s -X POST http://localhost:3000/convert \\");
-    println!("    -H 'Content-Type: application/json' \\");
-    println!("    -d '{{\"url\": \"https://github.com/owner/repo\"}}' | jq -r .markdown");
+    println!("  POST /convert  {{\"url\": \"https://github.com/...\"}}");;
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
