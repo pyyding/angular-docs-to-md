@@ -33,4 +33,20 @@ cargo build --release
 
 ## Claude Code skill
 
-Invoke directly from Claude Code with `/angular-docs-to-md <url>` — the skill is defined in `.claude/skills/angular-docs-to-md.md`.
+Invoke directly from Claude Code with `/angular-docs-to-md <url>` — the skill is defined in `.claude/skills/angular-docs-to-md/SKILL.md`.
+
+To install globally (available in any project):
+
+```bash
+cp -r .claude/skills/angular-docs-to-md ~/.claude/skills/
+```
+
+Then use it from any Claude Code session:
+
+```
+/angular-docs-to-md https://angular.dev/guide/signals
+/angular-docs-to-md https://angular.dev/guide/components --examples 2
+/angular-docs-to-md https://angular.dev/guide/templates/pipes --no-pills
+```
+
+The skill will build the binary automatically if needed.
