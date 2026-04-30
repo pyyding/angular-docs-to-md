@@ -1,12 +1,16 @@
+mod angular;
+mod client;
+
+use angular::convert_angular_docs;
 use axum::{
-    extract::Json,
+    extract::{Query, State},
     http::StatusCode,
     response::Json as ResponseJson,
-    routing::post,
+    routing::get,
     Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use regex::Regex;
+use client::AppState;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,22 +25,17 @@ struct ConvertRequest {
 }
 
 #[derive(Serialize)]
-struct ConvertResponse {
-    markdown: String,
+pub(crate) struct ErrorResponse {
+    pub(crate) error: String,
 }
 
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
-}
+pub(crate) type ApiError = (StatusCode, ResponseJson<ErrorResponse>);
 
-type ApiError = (StatusCode, ResponseJson<ErrorResponse>);
-
-fn bad_request(msg: impl Into<String>) -> ApiError {
+pub(crate) fn bad_request(msg: impl Into<String>) -> ApiError {
     (StatusCode::BAD_REQUEST, ResponseJson(ErrorResponse { error: msg.into() }))
 }
 
-fn bad_gateway(msg: impl Into<String>) -> ApiError {
+pub(crate) fn bad_gateway(msg: impl Into<String>) -> ApiError {
     (StatusCode::BAD_GATEWAY, ResponseJson(ErrorResponse { error: msg.into() }))
 }
 
@@ -93,8 +92,8 @@ fn api_url(link: &GithubLink) -> String {
 
 // ── GitHub HTTP helper ───────────────────────────────────────────────────────
 
-async fn github_get(url: &str) -> Result<Value, String> {
-    let mut req = Client::new()
+async fn github_get(client: &Client, url: &str) -> Result<Value, String> {
+    let mut req = client
         .get(url)
         .header("User-Agent", "gh2md/0.1")
         .header("Accept", "application/vnd.github+json");
@@ -121,125 +120,7 @@ fn blob_to_code_block(name: &str, data: &Value) -> String {
     format!("```{ext}\n{content}```")
 }
 
-// ── /convert-angular-docs ────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct AngularDocsRequest {
-    url: String,
-    /// How many tabs to expand per <docs-tab-group> (default: 1)
-    examples_per_group: Option<usize>,
-    /// Replace <docs-decorative-header> with a markdown h1 (default: true)
-    parse_header_html: Option<bool>,
-    /// Replace <docs-pill-row> with markdown links (default: true)
-    parse_pills: Option<bool>,
-}
-
-async fn fetch_text(client: &Client, url: &str) -> Result<String, String> {
-    client
-        .get(url)
-        .header("User-Agent", "gh2md/0.1")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .text()
-        .await
-        .map_err(|e| e.to_string())
-}
-
-fn replace_decorative_headers(markdown: &str) -> String {
-    let re = Regex::new(r#"(?s)<docs-decorative-header title="([^"]+)"[^>]*>.*?</docs-decorative-header>"#).unwrap();
-    re.replace_all(markdown, |caps: &regex::Captures| {
-        format!("# {}", &caps[1])
-    }).into_owned()
-}
-
-fn replace_pill_rows(markdown: &str) -> String {
-    let row_re  = Regex::new(r"(?s)<docs-pill-row>(.*?)</docs-pill-row>").unwrap();
-    let pill_re = Regex::new(r#"<docs-pill href="([^"]+)" title="([^"]+)"/>"#).unwrap();
-    row_re.replace_all(markdown, |row_cap: &regex::Captures| {
-        let inner = &row_cap[1];
-        let links: String = pill_re
-            .captures_iter(inner)
-            .map(|c| format!("- [{}]({})\n", &c[2], &c[1]))
-            .collect();
-        links.trim_end().to_string()
-    }).into_owned()
-}
-
-async fn expand_tab_groups(markdown: &str, examples_per_group: usize, client: &Client) -> Result<String, String> {
-    let tab_group_re = Regex::new(r"(?s)<docs-tab-group>(.+?)</docs-tab-group>").unwrap();
-    let tab_re       = Regex::new(r#"(?s)<docs-tab label="([^"]+)">(.+?)</docs-tab>"#).unwrap();
-    let code_re      = Regex::new(r#"<docs-code header="([^"]+)" path="([^"]+)"/>"#).unwrap();
-
-    // Collect replacements (start, end, replacement string)
-    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
-
-    for group_cap in tab_group_re.captures_iter(markdown) {
-        let full   = group_cap.get(0).unwrap();
-        let inner  = group_cap.get(1).unwrap().as_str();
-        let mut group_md = String::new();
-
-        for tab_cap in tab_re.captures_iter(inner).take(examples_per_group) {
-            let label       = &tab_cap[1];
-            let tab_content = &tab_cap[2];
-
-            group_md.push_str(&format!("**Example: {label}**\n\n"));
-
-            for code_cap in code_re.captures_iter(tab_content) {
-                let header  = &code_cap[1];
-                let path    = &code_cap[2];
-                let raw_url = format!(
-                    "https://raw.githubusercontent.com/angular/angular/main/{path}"
-                );
-
-                let content = fetch_text(client, &raw_url).await?;
-                let ext     = header.rsplit('.').next().unwrap_or("");
-                group_md.push_str(&format!("```{ext}\n// {header}\n{content}\n```\n\n"));
-            }
-        }
-
-        replacements.push((full.start(), full.end(), group_md.trim_end().to_string()));
-    }
-
-    // Apply in reverse so offsets stay valid
-    let mut result = markdown.to_string();
-    for (start, end, rep) in replacements.into_iter().rev() {
-        result.replace_range(start..end, &rep);
-    }
-
-    Ok(result)
-}
-
-async fn convert_angular_docs(
-    Json(payload): Json<AngularDocsRequest>,
-) -> Result<ResponseJson<ConvertResponse>, ApiError> {
-    let url                = payload.url.trim().trim_end_matches('/');
-    let examples_per_group = payload.examples_per_group.unwrap_or(1);
-    let parse_header_html  = payload.parse_header_html.unwrap_or(true);
-    let parse_pills        = payload.parse_pills.unwrap_or(true);
-
-    let path = url
-        .strip_prefix("https://angular.dev/")
-        .ok_or_else(|| bad_request("Not an angular.dev URL"))?;
-
-    let raw_url = format!(
-        "https://raw.githubusercontent.com/angular/angular/main/adev/src/content/{path}.md"
-    );
-
-    let client = Client::new();
-    let body   = fetch_text(&client, &raw_url).await.map_err(bad_gateway)?;
-
-    let body = if parse_header_html { replace_decorative_headers(&body) } else { body };
-    let body = if parse_pills        { replace_pill_rows(&body)          } else { body };
-
-    let markdown = expand_tab_groups(&body, examples_per_group, &client)
-        .await
-        .map_err(bad_gateway)?;
-
-    Ok(ResponseJson(ConvertResponse { markdown }))
-}
-
-// ── /convert ─────────────────────────────────────────────────────────────────
+// ── /gh-to-md ────────────────────────────────────────────────────────────────
 
 fn build_markdown(link: &GithubLink, data: &Value, original_url: &str) -> String {
     let s = |key: &str| data[key].as_str().unwrap_or("").to_string();
@@ -285,8 +166,9 @@ fn build_markdown(link: &GithubLink, data: &Value, original_url: &str) -> String
 }
 
 async fn convert(
-    Json(payload): Json<ConvertRequest>,
-) -> Result<ResponseJson<ConvertResponse>, ApiError> {
+    State(state): State<AppState>,
+    Query(payload): Query<ConvertRequest>,
+) -> Result<String, ApiError> {
     let url = payload.url.trim().trim_end_matches('/');
 
     if !url.contains("github.com") {
@@ -308,7 +190,7 @@ async fn convert(
             "https://api.github.com/repos/{owner}/{repo}/contents/{dir}?ref={branch}"
         );
 
-        let listing  = github_get(&dir_api).await.map_err(bad_gateway)?;
+        let listing  = github_get(&state.client, &dir_api).await.map_err(bad_gateway)?;
         let entries  = listing.as_array()
             .ok_or_else(|| bad_request("Directory listing was not an array"))?;
 
@@ -330,37 +212,39 @@ async fn convert(
         for entry in files {
             let name      = entry["name"].as_str().unwrap_or("");
             let file_url  = entry["url"].as_str().unwrap_or("");
-            let file_data = github_get(file_url).await.map_err(bad_gateway)?;
+            let file_data = github_get(&state.client, file_url).await.map_err(bad_gateway)?;
             blocks.push(format!("### {name}\n\n{}", blob_to_code_block(name, &file_data)));
         }
 
-        return Ok(ResponseJson(ConvertResponse { markdown: blocks.join("\n\n") }));
+        return Ok(blocks.join("\n\n"));
     }
 
     // default: single item
-    let data     = github_get(&api_url(&link)).await.map_err(bad_gateway)?;
-    let markdown = build_markdown(&link, &data, url);
-    Ok(ResponseJson(ConvertResponse { markdown }))
+    let data = github_get(&state.client, &api_url(&link)).await.map_err(bad_gateway)?;
+    Ok(build_markdown(&link, &data, url))
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
+    let state = AppState::new();
+
     let app = Router::new()
-        .route("/convert", post(convert))
-        .route("/convert-angular-docs", post(convert_angular_docs));
+        .route("/gh-to-md", get(convert))
+        .route("/angular-docs-to-md", get(convert_angular_docs))
+        .with_state(state);
 
     let addr = "0.0.0.0:3000";
-    println!("gh2md API listening on http://{addr}");
+    println!("angular-docs-to-md listening on http://{addr}");
     if env::var("GITHUB_TOKEN").is_ok() {
         println!("  GitHub token: ✓ (5000 req/hour)");
     } else {
         println!("  GitHub token: ✗ (60 req/hour — set GITHUB_TOKEN to increase)");
     }
     println!();
-    println!("  POST /convert               {{\"url\": \"...\", \"scope\": \"current-dir\"}}");
-    println!("  POST /convert-angular-docs  {{\"url\": \"https://angular.dev/...\"}}");
+    println!("  GET /gh-to-md?url=https://github.com/owner/repo[&scope=current-dir]");
+    println!("  GET /angular-docs-to-md?url=https://angular.dev/...");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
