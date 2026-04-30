@@ -1,9 +1,0 @@
-[package]
-name = "angular-docs-to-md"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-tokio = { version = "1", features = ["full"] }
-reqwest = "0.12"
-regex = "1"
