@@ -2,250 +2,49 @@ mod angular;
 mod client;
 
 use angular::convert_angular_docs;
-use axum::{
-    extract::{Query, State},
-    http::StatusCode,
-    response::Json as ResponseJson,
-    routing::get,
-    Router,
-};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use client::AppState;
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::env;
 
-// ── shared types ─────────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct ConvertRequest {
-    url: String,
-    scope: Option<String>,
+fn usage() -> ! {
+    eprintln!("Usage: angular-docs-to-md <URL> [options]");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --examples N    tab examples to expand per group (default: 1)");
+    eprintln!("  --no-header     skip <docs-decorative-header> parsing");
+    eprintln!("  --no-pills      skip <docs-pill-row> parsing");
+    eprintln!();
+    eprintln!("Example:");
+    eprintln!("  angular-docs-to-md https://angular.dev/guide/components --examples 2");
+    std::process::exit(1);
 }
-
-#[derive(Serialize)]
-pub(crate) struct ErrorResponse {
-    pub(crate) error: String,
-}
-
-pub(crate) type ApiError = (StatusCode, ResponseJson<ErrorResponse>);
-
-pub(crate) fn bad_request(msg: impl Into<String>) -> ApiError {
-    (StatusCode::BAD_REQUEST, ResponseJson(ErrorResponse { error: msg.into() }))
-}
-
-pub(crate) fn bad_gateway(msg: impl Into<String>) -> ApiError {
-    (StatusCode::BAD_GATEWAY, ResponseJson(ErrorResponse { error: msg.into() }))
-}
-
-// ── GitHub URL parser ────────────────────────────────────────────────────────
-
-enum GithubLink<'a> {
-    Repo    { owner: &'a str, repo: &'a str },
-    Issue   { owner: &'a str, repo: &'a str, number: &'a str },
-    Pull    { owner: &'a str, repo: &'a str, number: &'a str },
-    Commit  { owner: &'a str, repo: &'a str, sha: &'a str },
-    Blob    { owner: &'a str, repo: &'a str, branch: &'a str, path: String },
-    Tree    { owner: &'a str, repo: &'a str, branch: &'a str, sub: String },
-    Release { owner: &'a str, repo: &'a str, tag: &'a str },
-    Other   { owner: &'a str, repo: &'a str },
-}
-
-fn parse_github_url<'a>(parts: &'a [&'a str]) -> Result<GithubLink<'a>, String> {
-    if parts.len() < 2 {
-        return Err("Could not parse owner/repo from URL".to_string());
-    }
-    let owner = parts[0];
-    let repo  = parts[1];
-
-    let link = match parts.get(2) {
-        None => GithubLink::Repo { owner, repo },
-        Some(&"issues")   if parts.len() >= 4 => GithubLink::Issue   { owner, repo, number: parts[3] },
-        Some(&"pull")     if parts.len() >= 4 => GithubLink::Pull    { owner, repo, number: parts[3] },
-        Some(&"commit")   if parts.len() >= 4 => GithubLink::Commit  { owner, repo, sha: parts[3] },
-        Some(&"blob")     if parts.len() >= 5 => GithubLink::Blob    { owner, repo, branch: parts[3], path: parts[4..].join("/") },
-        Some(&"tree")     if parts.len() >= 4 => GithubLink::Tree    {
-            owner, repo, branch: parts[3],
-            sub: if parts.len() > 4 { format!("/{}", parts[4..].join("/")) } else { String::new() },
-        },
-        Some(&"releases") if parts.get(3) == Some(&"tag") && parts.len() >= 5 => {
-            GithubLink::Release { owner, repo, tag: parts[4] }
-        }
-        _ => GithubLink::Other { owner, repo },
-    };
-    Ok(link)
-}
-
-fn api_url(link: &GithubLink) -> String {
-    match link {
-        GithubLink::Repo    { owner, repo }               => format!("https://api.github.com/repos/{owner}/{repo}"),
-        GithubLink::Issue   { owner, repo, number }       => format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}"),
-        GithubLink::Pull    { owner, repo, number }       => format!("https://api.github.com/repos/{owner}/{repo}/pulls/{number}"),
-        GithubLink::Commit  { owner, repo, sha }          => format!("https://api.github.com/repos/{owner}/{repo}/commits/{sha}"),
-        GithubLink::Blob    { owner, repo, branch, path } => format!("https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"),
-        GithubLink::Release { owner, repo, tag }          => format!("https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}"),
-        GithubLink::Tree    { owner, repo, .. }
-        | GithubLink::Other { owner, repo }               => format!("https://api.github.com/repos/{owner}/{repo}"),
-    }
-}
-
-// ── GitHub HTTP helper ───────────────────────────────────────────────────────
-
-async fn github_get(client: &Client, url: &str) -> Result<Value, String> {
-    let mut req = client
-        .get(url)
-        .header("User-Agent", "gh2md/0.1")
-        .header("Accept", "application/vnd.github+json");
-
-    if let Ok(token) = env::var("GITHUB_TOKEN") {
-        req = req.header("Authorization", format!("Bearer {token}"));
-    }
-
-    req.send().await.map_err(|e| e.to_string())?
-       .json().await.map_err(|e| e.to_string())
-}
-
-// ── blob decode helper ───────────────────────────────────────────────────────
-
-fn blob_to_code_block(name: &str, data: &Value) -> String {
-    let ext     = name.rsplit('.').next().unwrap_or("");
-    let raw     = data["content"].as_str().unwrap_or("");
-    let cleaned: String = raw.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-    let content = STANDARD
-        .decode(cleaned.as_bytes())
-        .ok()
-        .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_default();
-    format!("```{ext}\n{content}```")
-}
-
-// ── /gh-to-md ────────────────────────────────────────────────────────────────
-
-fn build_markdown(link: &GithubLink, data: &Value, original_url: &str) -> String {
-    let s = |key: &str| data[key].as_str().unwrap_or("").to_string();
-
-    match link {
-        GithubLink::Repo { owner, repo } => {
-            let desc  = s("description");
-            let stars = data["stargazers_count"].as_u64().unwrap_or(0);
-            let lang  = s("language");
-            let label = if desc.is_empty() { format!("{owner}/{repo}") }
-                        else               { format!("{owner}/{repo} — {desc}") };
-            let mut md = format!("[{label}]({original_url})");
-            if !lang.is_empty() || stars > 0 { md.push_str(&format!(" `{lang}` ⭐{stars}")); }
-            md
-        }
-        GithubLink::Issue { owner, repo, number } => {
-            format!("[{owner}/{repo}#{number}: {}]({original_url}) `{}`", s("title"), s("state"))
-        }
-        GithubLink::Pull { owner, repo, number } => {
-            format!("[{owner}/{repo} PR#{number}: {}]({original_url}) `{}`", s("title"), s("state"))
-        }
-        GithubLink::Commit { owner, repo, sha } => {
-            let short = &sha[..7.min(sha.len())];
-            let msg   = data["commit"]["message"].as_str().unwrap_or("").lines().next().unwrap_or("");
-            format!("[{owner}/{repo}@{short}: {msg}]({original_url})")
-        }
-        GithubLink::Blob { path, .. } => {
-            let name = path.rsplit('/').next().unwrap_or(path.as_str());
-            blob_to_code_block(name, data)
-        }
-        GithubLink::Release { owner, repo, tag } => {
-            let name  = s("name");
-            let label = if name.is_empty() { tag.to_string() } else { name };
-            format!("[{owner}/{repo} {label}]({original_url})")
-        }
-        GithubLink::Tree { owner, repo, branch, sub } => {
-            format!("[{owner}/{repo}{sub}]({original_url}) `{branch}`")
-        }
-        GithubLink::Other { owner, repo } => {
-            format!("[{owner}/{repo}]({original_url})")
-        }
-    }
-}
-
-async fn convert(
-    State(state): State<AppState>,
-    Query(payload): Query<ConvertRequest>,
-) -> Result<String, ApiError> {
-    let url = payload.url.trim().trim_end_matches('/');
-
-    if !url.contains("github.com") {
-        return Err(bad_request("Not a GitHub URL"));
-    }
-
-    let path  = url.split("github.com/").nth(1).ok_or_else(|| bad_request("Invalid GitHub URL"))?;
-    let parts: Vec<&str> = path.split('/').collect();
-    let link  = parse_github_url(&parts).map_err(bad_request)?;
-
-    // scope: "current-dir" — fetch every file in the same directory
-    if payload.scope.as_deref() == Some("current-dir") {
-        let GithubLink::Blob { owner, repo, branch, path: file_path } = &link else {
-            return Err(bad_request("scope=current-dir requires a file (blob) URL"));
-        };
-
-        let dir = file_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        let dir_api = format!(
-            "https://api.github.com/repos/{owner}/{repo}/contents/{dir}?ref={branch}"
-        );
-
-        let listing  = github_get(&state.client, &dir_api).await.map_err(bad_gateway)?;
-        let entries  = listing.as_array()
-            .ok_or_else(|| bad_request("Directory listing was not an array"))?;
-
-        let ext_rank = |name: &str| -> u8 {
-            match name.rsplit('.').next().unwrap_or("") {
-                "ts" | "js"       => 0,
-                "html"            => 1,
-                "css" | "scss"    => 2,
-                _                 => 3,
-            }
-        };
-
-        let mut files: Vec<&Value> = entries.iter()
-            .filter(|e| e["type"].as_str() == Some("file"))
-            .collect();
-        files.sort_by_key(|e| ext_rank(e["name"].as_str().unwrap_or("")));
-
-        let mut blocks: Vec<String> = Vec::new();
-        for entry in files {
-            let name      = entry["name"].as_str().unwrap_or("");
-            let file_url  = entry["url"].as_str().unwrap_or("");
-            let file_data = github_get(&state.client, file_url).await.map_err(bad_gateway)?;
-            blocks.push(format!("### {name}\n\n{}", blob_to_code_block(name, &file_data)));
-        }
-
-        return Ok(blocks.join("\n\n"));
-    }
-
-    // default: single item
-    let data = github_get(&state.client, &api_url(&link)).await.map_err(bad_gateway)?;
-    Ok(build_markdown(&link, &data, url))
-}
-
-// ── main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
-    let state = AppState::new();
+    let args: Vec<String> = env::args().skip(1).collect();
 
-    let app = Router::new()
-        .route("/gh-to-md", get(convert))
-        .route("/angular-docs-to-md", get(convert_angular_docs))
-        .with_state(state);
-
-    let addr = "0.0.0.0:3000";
-    println!("angular-docs-to-md listening on http://{addr}");
-    if env::var("GITHUB_TOKEN").is_ok() {
-        println!("  GitHub token: ✓ (5000 req/hour)");
-    } else {
-        println!("  GitHub token: ✗ (60 req/hour — set GITHUB_TOKEN to increase)");
+    if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
+        usage();
     }
-    println!();
-    println!("  GET /gh-to-md?url=https://github.com/owner/repo[&scope=current-dir]");
-    println!("  GET /angular-docs-to-md?url=https://angular.dev/...");
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let url = &args[0];
+
+    if !url.contains("angular.dev") {
+        eprintln!("error: URL must be from angular.dev");
+        std::process::exit(1);
+    }
+
+    let examples: usize = args.windows(2)
+        .find(|w| w[0] == "--examples")
+        .and_then(|w| w[1].parse().ok())
+        .unwrap_or(1);
+
+    let parse_header = !args.iter().any(|a| a == "--no-header");
+    let parse_pills  = !args.iter().any(|a| a == "--no-pills");
+
+    let client = &AppState::new().client;
+
+    match convert_angular_docs(client, url, examples, parse_header, parse_pills).await {
+        Ok(md)  => print!("{md}"),
+        Err(e)  => { eprintln!("error: {e}"); std::process::exit(1); }
+    }
 }

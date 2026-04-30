@@ -1,24 +1,6 @@
-use axum::extract::{Query, State};
 use regex::Regex;
 use reqwest::Client;
-use serde::Deserialize;
 use std::sync::LazyLock;
-
-use crate::client::AppState;
-use crate::{ApiError, bad_gateway, bad_request};
-
-// ── request type ─────────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-pub struct AngularDocsRequest {
-    pub url: String,
-    /// How many tabs to expand per <docs-tab-group> (default: 1)
-    pub examples_per_group: Option<usize>,
-    /// Replace <docs-decorative-header> with a markdown h1 (default: true)
-    pub parse_header_html: Option<bool>,
-    /// Replace <docs-pill-row> with markdown links (default: true)
-    pub parse_pills: Option<bool>,
-}
 
 // ── compiled regexes (once per process) ──────────────────────────────────────
 
@@ -123,34 +105,28 @@ async fn expand_tab_groups(
     Ok(result)
 }
 
-// ── handler ───────────────────────────────────────────────────────────────────
+// ── public API ────────────────────────────────────────────────────────────────
 
 pub async fn convert_angular_docs(
-    State(state): State<AppState>,
-    Query(payload): Query<AngularDocsRequest>,
-) -> Result<String, ApiError> {
-    let url                = payload.url.trim().trim_end_matches('/');
-    let examples_per_group = payload.examples_per_group.unwrap_or(1);
-    let parse_header_html  = payload.parse_header_html.unwrap_or(true);
-    let parse_pills        = payload.parse_pills.unwrap_or(true);
+    client: &Client,
+    url: &str,
+    examples_per_group: usize,
+    parse_header_html: bool,
+    parse_pills: bool,
+) -> Result<String, String> {
+    let url = url.trim().trim_end_matches('/');
 
     let path = url
         .strip_prefix("https://angular.dev/")
-        .ok_or_else(|| bad_request("Not an angular.dev URL"))?;
+        .ok_or("Not an angular.dev URL")?;
 
     let raw_url = format!(
         "https://raw.githubusercontent.com/angular/angular/main/adev/src/content/{path}.md"
     );
 
-    let client = &state.client;
-    let body   = fetch_text(client, &raw_url).await.map_err(bad_gateway)?;
-
+    let body = fetch_text(client, &raw_url).await?;
     let body = if parse_header_html { replace_decorative_headers(&body) } else { body };
     let body = if parse_pills        { replace_pill_rows(&body)          } else { body };
 
-    let markdown = expand_tab_groups(&body, examples_per_group, client)
-        .await
-        .map_err(bad_gateway)?;
-
-    Ok(markdown)
+    expand_tab_groups(&body, examples_per_group, client).await
 }
