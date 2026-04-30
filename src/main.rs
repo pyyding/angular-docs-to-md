@@ -193,9 +193,23 @@ async fn convert(
         let entries  = listing.as_array()
             .ok_or_else(|| bad_request("Directory listing was not an array"))?;
 
+        let ext_rank = |name: &str| -> u8 {
+            match name.rsplit('.').next().unwrap_or("") {
+                "ts"   => 0,
+                "html" => 1,
+                "css"  => 2,
+                "scss" => 3,
+                _      => 4,
+            }
+        };
+
+        let mut files: Vec<&Value> = entries.iter()
+            .filter(|e| e["type"].as_str() == Some("file"))
+            .collect();
+        files.sort_by_key(|e| ext_rank(e["name"].as_str().unwrap_or("")));
+
         let mut blocks: Vec<String> = Vec::new();
-        for entry in entries {
-            if entry["type"].as_str() != Some("file") { continue; }
+        for entry in files {
             let name      = entry["name"].as_str().unwrap_or("");
             let file_url  = entry["url"].as_str().unwrap_or("");
             let file_data = github_get(file_url).await.map_err(bad_gateway)?;
