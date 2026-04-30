@@ -195,11 +195,10 @@ async fn convert(
 
         let ext_rank = |name: &str| -> u8 {
             match name.rsplit('.').next().unwrap_or("") {
-                "ts"   => 0,
-                "html" => 1,
-                "css"  => 2,
-                "scss" => 3,
-                _      => 4,
+                "ts" | "js"       => 0,
+                "html"            => 1,
+                "css" | "scss"    => 2,
+                _                 => 3,
             }
         };
 
