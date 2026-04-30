@@ -48,7 +48,7 @@ Fetches an [angular.dev](https://angular.dev) documentation page and returns it 
 **Examples**
 
 ```bash
-curl "http://localhost:3000/angular-docs-to-md?url=https://angular.dev/guide/signals"
+curl "http://localhost:3000/angular-docs-to-md?url=https://angular.dev/guide/signals/linked-signal"
 
 curl "http://localhost:3000/angular-docs-to-md?url=https://angular.dev/guide/routing&examples_per_group=2"
 ```
