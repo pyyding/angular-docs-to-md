@@ -29,6 +29,10 @@ static CODE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"<docs-code header="([^"]+)" path="([^"]+)"/>"#).unwrap()
 });
 
+static MULTIFILE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<docs-code-multifile[^>]*>(.*?)</docs-code-multifile>").unwrap()
+});
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 async fn fetch_text(client: &Client, url: &str) -> Result<String, String> {
@@ -105,6 +109,36 @@ async fn expand_tab_groups(
     Ok(result)
 }
 
+async fn expand_multifile_blocks(markdown: &str, client: &Client) -> Result<String, String> {
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+
+    for cap in MULTIFILE_RE.captures_iter(markdown) {
+        let full  = cap.get(0).unwrap();
+        let inner = cap.get(1).unwrap().as_str();
+        let mut block_md = String::new();
+
+        for code_cap in CODE_RE.captures_iter(inner) {
+            let header  = &code_cap[1];
+            let path    = &code_cap[2];
+            let raw_url = format!(
+                "https://raw.githubusercontent.com/angular/angular/main/{path}"
+            );
+            let content = fetch_text(client, &raw_url).await?;
+            let ext     = header.rsplit('.').next().unwrap_or("");
+            block_md.push_str(&format!("```{ext}\n// {header}\n{content}\n```\n\n"));
+        }
+
+        replacements.push((full.start(), full.end(), block_md.trim_end().to_string()));
+    }
+
+    let mut result = markdown.to_string();
+    for (start, end, rep) in replacements.into_iter().rev() {
+        result.replace_range(start..end, &rep);
+    }
+
+    Ok(result)
+}
+
 // ── public API ────────────────────────────────────────────────────────────────
 
 pub async fn convert_angular_docs(
@@ -128,5 +162,6 @@ pub async fn convert_angular_docs(
     let body = if parse_header_html { replace_decorative_headers(&body) } else { body };
     let body = if parse_pills        { replace_pill_rows(&body)          } else { body };
 
-    expand_tab_groups(&body, examples_per_group, client).await
+    let body = expand_tab_groups(&body, examples_per_group, client).await?;
+    expand_multifile_blocks(&body, client).await
 }
