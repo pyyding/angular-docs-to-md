@@ -50,7 +50,7 @@ Fetches an [angular.dev](https://angular.dev) documentation page and returns it 
 ```bash
 curl "http://localhost:3000/angular-docs-to-md?url=https://angular.dev/guide/signals/linked-signal"
 
-curl "http://localhost:3000/angular-docs-to-md?url=https://angular.dev/guide/routing&examples_per_group=2"
+curl "http://localhost:3000/angular-docs-to-md?url=https://angular.dev/guide/aria/menu&examples_per_group=2"
 ```
 
 ---
