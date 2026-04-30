@@ -13,6 +13,12 @@ use std::env;
 
 // ── shared types ─────────────────────────────────────────────────────────────
 
+#[derive(Deserialize)]
+struct ConvertRequest {
+    url: String,
+    scope: Option<String>,
+}
+
 #[derive(Serialize)]
 struct ConvertResponse {
     markdown: String,
@@ -73,14 +79,14 @@ fn parse_github_url<'a>(parts: &'a [&'a str]) -> Result<GithubLink<'a>, String> 
 
 fn api_url(link: &GithubLink) -> String {
     match link {
-        GithubLink::Repo    { owner, repo }          => format!("https://api.github.com/repos/{owner}/{repo}"),
-        GithubLink::Issue   { owner, repo, number }  => format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}"),
-        GithubLink::Pull    { owner, repo, number }  => format!("https://api.github.com/repos/{owner}/{repo}/pulls/{number}"),
-        GithubLink::Commit  { owner, repo, sha }     => format!("https://api.github.com/repos/{owner}/{repo}/commits/{sha}"),
+        GithubLink::Repo    { owner, repo }               => format!("https://api.github.com/repos/{owner}/{repo}"),
+        GithubLink::Issue   { owner, repo, number }       => format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}"),
+        GithubLink::Pull    { owner, repo, number }       => format!("https://api.github.com/repos/{owner}/{repo}/pulls/{number}"),
+        GithubLink::Commit  { owner, repo, sha }          => format!("https://api.github.com/repos/{owner}/{repo}/commits/{sha}"),
         GithubLink::Blob    { owner, repo, branch, path } => format!("https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"),
-        GithubLink::Release { owner, repo, tag }     => format!("https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}"),
+        GithubLink::Release { owner, repo, tag }          => format!("https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}"),
         GithubLink::Tree    { owner, repo, .. }
-        | GithubLink::Other { owner, repo }          => format!("https://api.github.com/repos/{owner}/{repo}"),
+        | GithubLink::Other { owner, repo }               => format!("https://api.github.com/repos/{owner}/{repo}"),
     }
 }
 
@@ -96,17 +102,15 @@ async fn github_get(url: &str) -> Result<Value, String> {
         req = req.header("Authorization", format!("Bearer {token}"));
     }
 
-    let data = req.send().await.map_err(|e| e.to_string())?
-                  .json().await.map_err(|e| e.to_string())?;
-    Ok(data)
+    req.send().await.map_err(|e| e.to_string())?
+       .json().await.map_err(|e| e.to_string())
 }
 
 // ── blob decode helper ───────────────────────────────────────────────────────
 
-/// Decode a GitHub API file response into a fenced markdown code block.
 fn blob_to_code_block(name: &str, data: &Value) -> String {
-    let ext = name.rsplit('.').next().unwrap_or("");
-    let raw = data["content"].as_str().unwrap_or("");
+    let ext     = name.rsplit('.').next().unwrap_or("");
+    let raw     = data["content"].as_str().unwrap_or("");
     let cleaned: String = raw.chars().filter(|c| *c != '\n' && *c != '\r').collect();
     let content = STANDARD
         .decode(cleaned.as_bytes())
@@ -117,11 +121,6 @@ fn blob_to_code_block(name: &str, data: &Value) -> String {
 }
 
 // ── /convert ─────────────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct ConvertRequest {
-    url: String,
-}
 
 fn build_markdown(link: &GithubLink, data: &Value, original_url: &str) -> String {
     let s = |key: &str| data[key].as_str().unwrap_or("").to_string();
@@ -178,78 +177,45 @@ async fn convert(
     let path  = url.split("github.com/").nth(1).ok_or_else(|| bad_request("Invalid GitHub URL"))?;
     let parts: Vec<&str> = path.split('/').collect();
     let link  = parse_github_url(&parts).map_err(bad_request)?;
-    let api   = api_url(&link);
-    let data  = github_get(&api).await.map_err(bad_gateway)?;
-    let markdown = build_markdown(&link, &data, url);
 
-    Ok(ResponseJson(ConvertResponse { markdown }))
-}
-
-// ── /fetch-file-md ───────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct FetchFileMdRequest {
-    url: String,
-    scope: Option<String>,
-}
-
-async fn fetch_file_md(
-    Json(payload): Json<FetchFileMdRequest>,
-) -> Result<ResponseJson<ConvertResponse>, ApiError> {
-    let url = payload.url.trim().trim_end_matches('/');
-
-    if !url.contains("github.com") {
-        return Err(bad_request("Not a GitHub URL"));
-    }
-
-    let path  = url.split("github.com/").nth(1).ok_or_else(|| bad_request("Invalid GitHub URL"))?;
-    let parts: Vec<&str> = path.split('/').collect();
-    let link  = parse_github_url(&parts).map_err(bad_request)?;
-
-    let GithubLink::Blob { owner, repo, branch, path: file_path } = &link else {
-        return Err(bad_request("URL must point to a file (blob)"));
-    };
-
+    // scope: "current-dir" — fetch every file in the same directory
     if payload.scope.as_deref() == Some("current-dir") {
-        // Strip filename to get the containing directory path
+        let GithubLink::Blob { owner, repo, branch, path: file_path } = &link else {
+            return Err(bad_request("scope=current-dir requires a file (blob) URL"));
+        };
+
         let dir = file_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         let dir_api = format!(
             "https://api.github.com/repos/{owner}/{repo}/contents/{dir}?ref={branch}"
         );
 
-        let listing = github_get(&dir_api).await.map_err(bad_gateway)?;
-
-        let entries = listing.as_array()
+        let listing  = github_get(&dir_api).await.map_err(bad_gateway)?;
+        let entries  = listing.as_array()
             .ok_or_else(|| bad_request("Directory listing was not an array"))?;
 
         let mut blocks: Vec<String> = Vec::new();
         for entry in entries {
-            if entry["type"].as_str() != Some("file") {
-                continue;
-            }
+            if entry["type"].as_str() != Some("file") { continue; }
             let name      = entry["name"].as_str().unwrap_or("");
             let file_url  = entry["url"].as_str().unwrap_or("");
             let file_data = github_get(file_url).await.map_err(bad_gateway)?;
             blocks.push(format!("### {name}\n\n{}", blob_to_code_block(name, &file_data)));
         }
 
-        Ok(ResponseJson(ConvertResponse { markdown: blocks.join("\n\n") }))
-    } else {
-        // Single file
-        let api  = api_url(&link);
-        let data = github_get(&api).await.map_err(bad_gateway)?;
-        let name = file_path.rsplit('/').next().unwrap_or(file_path.as_str());
-        Ok(ResponseJson(ConvertResponse { markdown: blob_to_code_block(name, &data) }))
+        return Ok(ResponseJson(ConvertResponse { markdown: blocks.join("\n\n") }));
     }
+
+    // default: single item
+    let data     = github_get(&api_url(&link)).await.map_err(bad_gateway)?;
+    let markdown = build_markdown(&link, &data, url);
+    Ok(ResponseJson(ConvertResponse { markdown }))
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
-    let app = Router::new()
-        .route("/convert",      post(convert))
-        .route("/fetch-file-md", post(fetch_file_md));
+    let app = Router::new().route("/convert", post(convert));
 
     let addr = "0.0.0.0:3000";
     println!("gh2md API listening on http://{addr}");
@@ -259,8 +225,7 @@ async fn main() {
         println!("  GitHub token: ✗ (60 req/hour — set GITHUB_TOKEN to increase)");
     }
     println!();
-    println!("  POST /convert        {{\"url\": \"https://github.com/...\"}}");
-    println!("  POST /fetch-file-md  {{\"url\": \"...\", \"scope\": \"current-dir\"}}");
+    println!("  POST /convert  {{\"url\": \"...\", \"scope\": \"current-dir\"}}");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
