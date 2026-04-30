@@ -6,6 +6,10 @@
   "bin": {
     "angular-docs-to-md": "./index.js"
   },
+  "files": [
+    "index.js",
+    "SKILL.md"
+  ],
   "engines": {
     "node": ">=18"
   },
