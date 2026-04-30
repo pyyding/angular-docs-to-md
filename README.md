@@ -20,15 +20,15 @@ npx angular-docs-to-md https://angular.dev/guide/components --examples 2
 npx angular-docs-to-md https://angular.dev/guide/templates/pipes --no-pills
 ```
 
-## Claude Code skill
+## Agent skill
 
-Install the skill so Claude can fetch Angular docs on demand:
+Install via the [skills CLI](https://skills.sh):
 
 ```bash
 npx skills add pyyding/angular-docs-to-md
 ```
 
-Then use it from any Claude Code session:
+Then invoke from any agent session:
 
 ```
 /angular-docs-to-md https://angular.dev/guide/signals
