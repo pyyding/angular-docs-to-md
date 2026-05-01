@@ -1,10 +1,44 @@
 #!/usr/bin/env node
 
+import fs   from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
 // ── regexes ──────────────────────────────────────────────────────────────────
 
 const HEADER_RE   = /<docs-decorative-header title="([^"]+)"[^>]*>[\s\S]*?<\/docs-decorative-header>/g;
 const PILL_ROW_RE = /<docs-pill-row>([\s\S]*?)<\/docs-pill-row>/g;
-const PILL_RE     = /<docs-pill href="([^"]+)" title="([^"]+)"\/>/g;
+
+// ── cache ─────────────────────────────────────────────────────────────────────
+
+const CACHE_DIR = path.join(__dirname, '.cache');
+const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+function urlToCacheFile(url) {
+  const slug = url.trim()
+    .replace(/\/$/, '')
+    .replace(/^https?:\/\/angular\.dev\//, '')
+    .replace(/[^a-z0-9_-]/gi, '--');
+  return path.join(CACHE_DIR, `${slug}.md`);
+}
+
+function cacheRead(file) {
+  try {
+    const stat = fs.statSync(file);
+    const age  = Date.now() - stat.mtimeMs;
+    if (age > CACHE_TTL) return null;          // stale
+    return fs.readFileSync(file, 'utf8');
+  } catch {
+    return null;                               // missing
+  }
+}
+
+function cacheWrite(file, content) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, content, 'utf8');
+}
 
 // ── http ──────────────────────────────────────────────────────────────────────
 
@@ -88,17 +122,45 @@ function applyReplacements(str, replacements) {
 
 // ── public ────────────────────────────────────────────────────────────────────
 
-async function convertAngularDocs(url, { examplesPerGroup = 1, parseHeader = true, parsePills = true } = {}) {
+async function convertAngularDocs(url, {
+  examplesPerGroup = 1,
+  parseHeader = true,
+  parsePills  = true,
+  refresh     = false,
+} = {}) {
   url = url.trim().replace(/\/$/, '');
 
-  const path = url.replace(/^https?:\/\/angular\.dev\//, '');
-  const rawUrl = `https://raw.githubusercontent.com/angular/angular/main/adev/src/content/${path}.md`;
+  const cacheFile = urlToCacheFile(url);
+
+  if (!refresh) {
+    const cached = cacheRead(cacheFile);
+    if (cached !== null) {
+      process.stderr.write(`[cache] hit  ${cacheFile}\n`);
+      return cached;
+    }
+    try {
+      fs.statSync(cacheFile);
+      // file exists but was stale (cacheRead returned null)
+      process.stderr.write(`[cache] stale ${cacheFile} — re-fetching\n`);
+    } catch {
+      // file doesn't exist yet — first fetch, say nothing
+    }
+  } else {
+    process.stderr.write(`[cache] refresh requested — re-fetching\n`);
+  }
+
+  const docPath = url.replace(/^https?:\/\/angular\.dev\//, '');
+  const rawUrl  = `https://raw.githubusercontent.com/angular/angular/main/adev/src/content/${docPath}.md`;
 
   let body = await fetchText(rawUrl);
   if (parseHeader) body = replaceDecorativeHeaders(body);
   if (parsePills)  body = replacePillRows(body);
   body = await expandTabGroups(body, examplesPerGroup);
   body = await expandMultifileBlocks(body);
+
+  cacheWrite(cacheFile, body);
+  process.stderr.write(`[cache] saved ${cacheFile}\n`);
+
   return body;
 }
 
@@ -113,6 +175,10 @@ if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
   console.error('  --examples N    tab examples to expand per group (default: 1)');
   console.error('  --no-header     skip <docs-decorative-header> parsing');
   console.error('  --no-pills      skip <docs-pill-row> parsing');
+  console.error('  --refresh       ignore cache and re-fetch (overwrites cached file)');
+  console.error('  --no-cache      skip both reading and writing the cache');
+  console.error('');
+  console.error(`Cache directory: ${CACHE_DIR}`);
   process.exit(args.length === 0 ? 1 : 0);
 }
 
@@ -122,11 +188,29 @@ if (!url.includes('angular.dev')) {
   process.exit(1);
 }
 
-const examplesIdx    = args.indexOf('--examples');
+const examplesIdx      = args.indexOf('--examples');
 const examplesPerGroup = examplesIdx !== -1 ? (parseInt(args[examplesIdx + 1], 10) || 1) : 1;
-const parseHeader    = !args.includes('--no-header');
-const parsePills     = !args.includes('--no-pills');
+const parseHeader      = !args.includes('--no-header');
+const parsePills       = !args.includes('--no-pills');
+const refresh          = args.includes('--refresh');
+const noCache          = args.includes('--no-cache');
 
-convertAngularDocs(url, { examplesPerGroup, parseHeader, parsePills })
+async function main() {
+  if (noCache) {
+    // Bypass cache entirely — fetch and print, don't save
+    const url2     = args[0].trim().replace(/\/$/, '');
+    const docPath  = url2.replace(/^https?:\/\/angular\.dev\//, '');
+    const rawUrl   = `https://raw.githubusercontent.com/angular/angular/main/adev/src/content/${docPath}.md`;
+    let body = await fetchText(rawUrl);
+    if (parseHeader) body = replaceDecorativeHeaders(body);
+    if (parsePills)  body = replacePillRows(body);
+    body = await expandTabGroups(body, examplesPerGroup);
+    body = await expandMultifileBlocks(body);
+    return body;
+  }
+  return convertAngularDocs(url, { examplesPerGroup, parseHeader, parsePills, refresh });
+}
+
+main()
   .then(md => process.stdout.write(md + '\n'))
   .catch(err => { console.error(`error: ${err.message}`); process.exit(1); });
