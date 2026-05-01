@@ -1,6 +1,6 @@
 {
   "name": "angular-docs-to-md",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Fetch an angular.dev page and convert it to clean Markdown",
   "type": "module",
   "bin": {
